@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config --quiet
+      - run: docker compose run --rm --no-deps kong kong config parse /kong/kong.yml
+      # Сервисов за шлюзом в CI нет: проверяются маршруты, закрытые пути, CORS и лимиты самого Kong.
+      - run: docker compose up -d --wait
+      - run: ./scripts/smoke.sh
+      - if: failure()
+        run: docker compose logs kong

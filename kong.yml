@@ -1,0 +1,122 @@
+# Декларативная конфигурация Kong (DB-less) — единая точка входа платформы.
+#
+# Наружу открыты только публичные API /api/v1/... и ключ проверки токенов. Внутренние API
+# (/catalog/v1, /media/v1, /internal), /actuator и спецификации сервисов не маршрутизируются:
+# на них Kong отвечает 404.
+#
+# Сервисы запускаются на хосте (bootRun), Kong в контейнере обращается к ним через
+# host.docker.internal. Порты — предложение команде (вопрос К-6 в docs).
+_format_version: "3.0"
+_transform: true
+
+services:
+  - name: auth
+    url: http://host.docker.internal:8080
+    routes:
+      - name: auth
+        paths: ['~/api/v1/(auth|me|users)(/|$)', '~/\.well-known/jwks\.json$']
+        strip_path: false
+      # Отдельные маршруты, чтобы у входа и регистрации были свои счётчики лимита (FR-053).
+      - name: auth-login
+        methods: [POST]
+        paths: ['~/api/v1/auth/login$']
+        strip_path: false
+        regex_priority: 10
+        plugins:
+          - name: rate-limiting
+            config: &auth-rate-limit
+              minute: 10
+              limit_by: ip
+              policy: local
+              error_message: Too many attempts, try again later
+      - name: auth-register
+        methods: [POST]
+        paths: ['~/api/v1/auth/register$']
+        strip_path: false
+        regex_priority: 10
+        plugins:
+          - name: rate-limiting
+            config: *auth-rate-limit
+
+  - name: submission
+    url: http://host.docker.internal:8081
+    routes:
+      - name: submission
+        paths: ['~/api/v1/(submissions|location-suggestions)(/|$)']
+        strip_path: false
+
+  - name: moderation
+    url: http://host.docker.internal:8082
+    routes:
+      - name: moderation
+        paths: ['~/api/v1/(moderation|reports)(/|$)']
+        strip_path: false
+
+  - name: media
+    url: http://host.docker.internal:8083
+    routes:
+      - name: media
+        paths: ['~/api/v1/media-assets(/|$)']
+        strip_path: false
+        plugins:
+          # Загрузка изображений: в media-service max-request-size 11MB.
+          - name: request-size-limiting
+            config:
+              allowed_payload_size: 11
+              size_unit: megabytes
+
+  - name: catalog
+    url: http://host.docker.internal:8084
+    routes:
+      - name: catalog
+        paths: ['~/api/v1/catalog(/|$)']
+        strip_path: false
+
+  - name: search
+    url: http://host.docker.internal:8085
+    routes:
+      - name: search
+        paths: ['~/api/v1/search(/|$)']
+        strip_path: false
+
+plugins:
+  # Недопустимый идентификатор от клиента отбрасывается до плагина correlation-id, и тот
+  # генерирует новый. Формат — тот, что принимают все сервисы (auth и submission).
+  - name: pre-function
+    config:
+      access:
+        - |
+          local id = kong.request.get_header("X-Correlation-ID")
+          if id and not ngx.re.find(id, [[^[A-Za-z0-9._-]{1,64}$]], "jo") then
+            kong.service.request.clear_header("X-Correlation-ID")
+          end
+
+  # Сквозной идентификатор: если клиент его не передал, Kong генерирует UUID и передаёт
+  # сервису; значение возвращается клиенту в ответе.
+  - name: correlation-id
+    config:
+      header_name: X-Correlation-ID
+      generator: uuid
+      echo_downstream: true
+
+  # Лимит тела по умолчанию; у media свой, больший. Сервисы дополнительно проверяют свои лимиты.
+  - name: request-size-limiting
+    config:
+      allowed_payload_size: 1
+      size_unit: megabytes
+
+  # Сервисный токен media принимается только во внутренних вызовах, снаружи его срезаем.
+  - name: request-transformer
+    config:
+      remove:
+        headers: [X-Service-Token]
+
+  # Заголовки совпадают с CORS-настройкой submission.
+  - name: cors
+    config:
+      origins: ['http://localhost:5173']
+      methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+      headers: [Authorization, Content-Type, If-Match, Idempotency-Key, X-Correlation-ID]
+      exposed_headers: [ETag, Location, Retry-After, X-Correlation-ID]
+      credentials: false
+      max_age: 3600
